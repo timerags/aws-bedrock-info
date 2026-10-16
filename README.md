@@ -31,6 +31,10 @@ Python標準ライブラリのみで動作します（追加の pip install は�
   [AWSドキュメントのモデルカードページ](https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html)
   をスクレイピングしてEOL日付を補完しています。非公式な手段のため、AWSがページ構造を変更すると
   EOL日付の取得だけ失敗する可能性があります（その場合も `status` 列自体は影響を受けません）。
+- 延長アクセス開始日（Public extended access start date。この日以降はプロバイダーにより料金が引き上げられる
+  場合があります）はモデルカードには載っていないため、
+  [Model lifecycle (Legacy)](https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle-legacy.html)
+  ページの表からModel ID＋リージョンで照合して取得しています。表に載っていないモデルは空欄になります。
 
 ## GitHub Actions + GitHub Pagesのセットアップ手順
 

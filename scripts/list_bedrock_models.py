@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 List Amazon Bedrock foundation models for one or more regions, with their
-lifecycle status (ACTIVE / LEGACY) and, for LEGACY models, the EOL date.
+lifecycle status (ACTIVE / LEGACY) and, for LEGACY models, the EOL date and
+the public extended access start date.
 
 The Bedrock API (list-foundation-models / get-foundation-model) only returns
 `modelLifecycle.status`. It does NOT populate the EOL date even though the
@@ -11,6 +12,11 @@ on the AWS docs site, so this script scrapes that page for LEGACY models.
 This is best-effort: if AWS changes the docs page structure, EOL lookup may
 break (the status/ACTIVE/LEGACY columns, which come from the real API, will
 keep working regardless).
+
+The public extended access start date (the point in the Legacy period from
+which the provider may raise prices) is not on the model cards; it is scraped
+from the "Model lifecycle (Legacy)" docs page table, keyed by model ID and
+region.
 
 Usage:
     ./scripts/list_bedrock_models.py [--region REGION ...] [--no-eol] [--csv FILE] [--html FILE]
@@ -39,12 +45,18 @@ JST = timezone(timedelta(hours=9), name="JST")
 
 MODEL_CARDS_INDEX_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html"
 MODEL_CARD_BASE_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/"
+LIFECYCLE_LEGACY_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle-legacy.html"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; bedrock-model-lister/1.0)"}
 
 LINK_RE = re.compile(r'href="\./(model-card-[a-z0-9-]+\.html)">([^<]+)</a>')
 EOL_DATE_RE = re.compile(r"<b>Model EOL date:</b>\s*([^<]+?)\s*</p>")
 LEGACY_PERIOD_RE = re.compile(r"<b>Legacy period:</b>\s*([^<]+?)\s*</p>")
 LAUNCH_DATE_RE = re.compile(r"<b>Model launch date:</b>\s*([^<]+?)\s*</p>")
+TABLE_RE = re.compile(r"<table.*?</table>", re.S)
+TR_RE = re.compile(r"<tr.*?</tr>", re.S)
+CELL_RE = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.S)
+TAG_RE = re.compile(r"<[^>]+>")
+CONTEXT_SUFFIX_RE = re.compile(r":\d+k$")
 
 
 def fetch_url(url: str) -> str:
@@ -135,6 +147,51 @@ def fetch_model_card_info(slug: str) -> tuple[str | None, str | None, str | None
     return eol_date, legacy_period, launch_date
 
 
+def cell_text(cell_html: str) -> str:
+    return " ".join(html_module.unescape(TAG_RE.sub(" ", cell_html)).split())
+
+
+def fetch_lifecycle_table() -> dict[str, list[dict]]:
+    """Parse the "Models with a scheduled EOL date" table on the legacy lifecycle page.
+
+    Returns {model_id: [{"regions": set, "legacy_date", "eol_date", "extended_access_date"}, ...]}.
+    The leading provider/name columns use rowspan, so cells are read from the
+    right: Model ID | Regions | Legacy date | EOL date | Public extended access start date.
+    """
+    html = fetch_url(LIFECYCLE_LEGACY_URL)
+    tables = TABLE_RE.findall(html)
+    if not tables:
+        return {}
+    result: dict[str, list[dict]] = {}
+    for tr in TR_RE.findall(tables[0]):
+        cells = [cell_text(c) for c in CELL_RE.findall(tr)]
+        if len(cells) < 5 or "<th" in tr:
+            continue
+        ids_text, regions_text, legacy_date, eol_date, extended = cells[-5:]
+        entry = {
+            "regions": {r.strip() for r in regions_text.split(",") if r.strip()},
+            "legacy_date": legacy_date,
+            "eol_date": eol_date,
+            "extended_access_date": "" if extended in ("—", "-", "") else extended,
+        }
+        # e.g. "deepseek.v3-v1:0 (bedrock-runtime), deepseek.v3.1 (bedrock-mantle)"
+        for model_id in ids_text.split(","):
+            model_id = PAREN_SUFFIX_RE.sub("", model_id).strip()
+            if model_id:
+                result.setdefault(model_id, []).append(entry)
+    return result
+
+
+def lookup_lifecycle(model_id: str, region: str, table: dict[str, list[dict]]) -> dict | None:
+    entries = table.get(model_id) or table.get(CONTEXT_SUFFIX_RE.sub("", model_id))
+    if not entries:
+        return None
+    for e in entries:
+        if region in e["regions"]:
+            return e
+    return entries[0] if len(entries) == 1 else None
+
+
 WEEKDAY_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
 MONTH_NAMES = {
@@ -198,6 +255,8 @@ def parse_eol_date(text: str) -> datetime | None:
 def format_date_ja(text: str) -> str:
     dt, has_day = parse_scraped_date(text)
     if dt is None:
+        if text and text.lower() == "to be announced":
+            return "未発表"
         return text or ""
     if has_day:
         return f"{dt.year}年{dt.month}月{dt.day}日({WEEKDAY_JA[dt.weekday()]})"
@@ -250,6 +309,23 @@ def render_html(rows: list[dict], regions: list[str]) -> str:
             return "(本日)"
         return f"(あと{days}日)"
 
+    def ext_days_label(r: dict) -> str:
+        dt = parse_eol_date(r["extended_access_date"])
+        if dt is None:
+            return ""
+        days = (dt - now).days
+        if days < 0:
+            return "(適用中)"
+        if days == 0:
+            return "(本日から)"
+        return f"(あと{days}日)"
+
+    def ext_cell(r: dict) -> str:
+        if not r["extended_access_date"]:
+            return "&ndash;"
+        text = html_module.escape(format_date_ja(r["extended_access_date"]))
+        return f'{text} <span class="days-label">{html_module.escape(ext_days_label(r))}</span>'
+
     body_rows = []
     for r in rows:
         status_class = "status-active" if r["status"] == "ACTIVE" else "status-legacy"
@@ -265,6 +341,7 @@ def render_html(rows: list[dict], regions: list[str]) -> str:
           <td>{model_name_link(r)}</td>
           <td><span class="badge {status_class}">{html_module.escape(r['status'])}</span></td>
           <td>{launch_text}</td>
+          <td>{ext_cell(r)}</td>
           <td>{eol_text} <span class="days-label">{html_module.escape(days_label)}</span></td>
         </tr>""")
 
@@ -279,6 +356,7 @@ def render_html(rows: list[dict], regions: list[str]) -> str:
           <td><code>{html_module.escape(r['model_id'])}</code></td>
           <td>{html_module.escape(r['region'])}</td>
           <td>{launch_text}</td>
+          <td>{ext_cell(r)}</td>
           <td>{eol_text} <span class="days-label">{html_module.escape(eol_days_label(r))}</span></td>
         </tr>""")
 
@@ -456,6 +534,11 @@ def render_html(rows: list[dict], regions: list[str]) -> str:
     padding: 0.4rem 0.6rem;
     font-size: 0.85rem;
   }}
+  .note {{
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    margin: -0.5rem 0 1rem;
+  }}
   footer {{
     color: var(--text-muted);
     font-size: 0.78rem;
@@ -494,10 +577,11 @@ def render_html(rows: list[dict], regions: list[str]) -> str:
 
   <section>
     <h2>⚠ LEGACY モデル一覧（EOL日付順）</h2>
+    <p class="note">延長アクセス（Public extended access）期間中もEOL日までは利用できますが、モデルプロバイダーにより料金が引き上げられる場合があります。</p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>モデル名</th><th>Model ID</th><th>リージョン</th><th>提供開始日</th><th>EOL日</th></tr></thead>
-        <tbody>{"".join(legacy_summary_rows) if legacy_summary_rows else '<tr><td colspan="5">現在LEGACYのモデルはありません</td></tr>'}</tbody>
+        <thead><tr><th>モデル名</th><th>Model ID</th><th>リージョン</th><th>提供開始日</th><th>延長アクセス開始日</th><th>EOL日</th></tr></thead>
+        <tbody>{"".join(legacy_summary_rows) if legacy_summary_rows else '<tr><td colspan="6">現在LEGACYのモデルはありません</td></tr>'}</tbody>
       </table>
     </div>
   </section>
@@ -518,14 +602,14 @@ def render_html(rows: list[dict], regions: list[str]) -> str:
     </div>
     <div class="table-wrap">
       <table id="modelsTable">
-        <thead><tr><th>リージョン</th><th>プロバイダー</th><th>Model ID</th><th>モデル名</th><th>ステータス</th><th>提供開始日</th><th>EOL日</th></tr></thead>
+        <thead><tr><th>リージョン</th><th>プロバイダー</th><th>Model ID</th><th>モデル名</th><th>ステータス</th><th>提供開始日</th><th>延長アクセス開始日</th><th>EOL日</th></tr></thead>
         <tbody>{"".join(body_rows)}</tbody>
       </table>
     </div>
   </section>
 
   <footer>
-    提供開始日・EOL日はAWS公式APIでは提供されないため、<a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html">Bedrockモデルカードのドキュメント</a>をスクレイピングして補完しています（取得失敗時は空欄になります）。ステータス（ACTIVE/LEGACY）は <code>aws bedrock list-foundation-models</code> の公式APIレスポンスです。<br>
+    提供開始日・延長アクセス開始日・EOL日はAWS公式APIでは提供されないため、<a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html">Bedrockモデルカード</a>および<a href="{LIFECYCLE_LEGACY_URL}">Model lifecycle (Legacy)</a>のドキュメントをスクレイピングして補完しています（取得失敗時は空欄になります）。ステータス（ACTIVE/LEGACY）は <code>aws bedrock list-foundation-models</code> の公式APIレスポンスです。<br>
     Generated by <code>scripts/list_bedrock_models.py</code>
   </footer>
 </main>
@@ -554,7 +638,7 @@ def main() -> int:
         "--region", action="append", dest="regions",
         help="AWS region to query. Repeatable. Default: ap-northeast-1",
     )
-    parser.add_argument("--no-eol", action="store_true", help="Skip launch/EOL date lookup (faster, no doc scraping)")
+    parser.add_argument("--no-eol", action="store_true", help="Skip launch/EOL/extended access date lookup (faster, no doc scraping)")
     parser.add_argument("--csv", metavar="FILE", help="Write results to a CSV file")
     parser.add_argument("--html", metavar="FILE", help="Write results to a self-contained HTML report")
     args = parser.parse_args()
@@ -573,6 +657,7 @@ def main() -> int:
                 "status": m.get("modelLifecycle", {}).get("status", ""),
                 "eol_date": "",
                 "legacy_period": "",
+                "extended_access_date": "",
                 "launch_date": "",
                 "model_card_url": "",
             })
@@ -603,19 +688,30 @@ def main() -> int:
                     print(f"Warning: failed to fetch model card info for '{name}' ({e})", file=sys.stderr)
                     card_cache[name] = (None, None, None)
 
+            lifecycle_table: dict[str, list[dict]] = {}
+            if any(r["status"] == "LEGACY" for r in rows):
+                try:
+                    lifecycle_table = fetch_lifecycle_table()
+                except Exception as e:
+                    print(f"Warning: could not fetch model lifecycle page ({e}); skipping extended access lookup", file=sys.stderr)
+
             for r in rows:
                 eol_date, legacy_period, launch_date = card_cache.get(r["model_name"], (None, None, None))
                 r["launch_date"] = launch_date or ""
                 r["model_card_url"] = card_url_cache.get(r["model_name"]) or ""
                 if r["status"] == "LEGACY":
+                    lifecycle = lookup_lifecycle(r["model_id"], r["region"], lifecycle_table) or {}
+                    if not parse_eol_date(eol_date or ""):
+                        eol_date = lifecycle.get("eol_date") or eol_date
                     r["eol_date"] = eol_date or "unknown (check model card)"
                     r["legacy_period"] = legacy_period or ""
+                    r["extended_access_date"] = lifecycle.get("extended_access_date", "")
 
     rows.sort(key=lambda r: (r["region"], r["provider"], r["model_id"]))
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["region", "provider", "model_id", "model_name", "status", "launch_date", "eol_date", "legacy_period", "model_card_url"])
+            writer = csv.DictWriter(f, fieldnames=["region", "provider", "model_id", "model_name", "status", "launch_date", "extended_access_date", "eol_date", "legacy_period", "model_card_url"])
             writer.writeheader()
             writer.writerows(rows)
         print(f"Wrote {len(rows)} rows to {args.csv}", file=sys.stderr)
@@ -627,11 +723,11 @@ def main() -> int:
             f.write(render_html(rows, regions))
         print(f"Wrote HTML report to {args.html}", file=sys.stderr)
 
-    headers = ["REGION", "PROVIDER", "MODEL_ID", "MODEL_NAME", "STATUS", "LAUNCH_DATE", "EOL_DATE"]
+    headers = ["REGION", "PROVIDER", "MODEL_ID", "MODEL_NAME", "STATUS", "LAUNCH_DATE", "EXT_ACCESS_DATE", "EOL_DATE"]
     col_widths = [len(h) for h in headers]
     table_rows = []
     for r in rows:
-        row = [r["region"], r["provider"], r["model_id"], r["model_name"], r["status"], r["launch_date"], r["eol_date"]]
+        row = [r["region"], r["provider"], r["model_id"], r["model_name"], r["status"], r["launch_date"], r["extended_access_date"], r["eol_date"]]
         table_rows.append(row)
         for i, cell in enumerate(row):
             col_widths[i] = max(col_widths[i], len(cell))
